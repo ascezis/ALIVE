@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+/design/
+__pycache__/
+node_modules/
+dist/
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal

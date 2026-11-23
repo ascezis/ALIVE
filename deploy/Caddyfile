@@ -1,0 +1,7 @@
+{
+	admin off
+}
+
+{$ALIVE_PUBLIC_HOST:localhost} {
+	reverse_proxy {$ALIVE_UPSTREAM:alive-app:8080}
+}

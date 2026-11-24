@@ -113,6 +113,11 @@ class WorkoutState(Model):
 class Snapshot(Model):
     revision: NonNegative
     state: WorkoutState
+    dailyWorkoutGoal: Literal[1, 2] = 1
+
+
+def daily_workout_goal() -> Literal[1, 2]:
+    return 2 if os.environ.get("ALIVE_DAILY_WORKOUT_GOAL") == "2" else 1
 
 
 class ReportRange(BaseModel):
@@ -206,13 +211,15 @@ def load_state(user: Annotated[str, Depends(owner)]) -> Snapshot:
             "SELECT revision, state_json FROM alive_workout_state WHERE owner = ?", (user,),
         ).fetchone()
     if row is None:
-        return Snapshot(revision=0, state=WorkoutState())
-    return Snapshot(revision=row[0], state=WorkoutState.model_validate_json(row[1]))
+        return Snapshot(revision=0, state=WorkoutState(), dailyWorkoutGoal=daily_workout_goal())
+    return Snapshot(revision=row[0], state=WorkoutState.model_validate_json(row[1]),
+                    dailyWorkoutGoal=daily_workout_goal())
 
 
 @app.put("/api/state")
 def save_state(change: Snapshot, user: Annotated[str, Depends(owner)]) -> Snapshot:
     encoded = json.dumps(change.state.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+    goal = daily_workout_goal()
     with closing(connect()) as database, database:
         database.execute("BEGIN IMMEDIATE")
         current = database.execute(
@@ -220,7 +227,7 @@ def save_state(change: Snapshot, user: Annotated[str, Depends(owner)]) -> Snapsh
         ).fetchone()
         revision = current[0] if current else 0
         if current and current[1] == encoded:
-            return Snapshot(revision=revision, state=change.state)
+            return Snapshot(revision=revision, state=change.state, dailyWorkoutGoal=goal)
         if change.revision != revision:
             raise HTTPException(409, "The diary changed in another window")
         revision += 1
@@ -230,7 +237,7 @@ def save_state(change: Snapshot, user: Annotated[str, Depends(owner)]) -> Snapsh
                    revision = excluded.revision, state_json = excluded.state_json""",
             (user, revision, encoded),
         )
-    return Snapshot(revision=revision, state=change.state)
+    return Snapshot(revision=revision, state=change.state, dailyWorkoutGoal=goal)
 
 
 report_files = {}

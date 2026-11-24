@@ -1,12 +1,13 @@
 """Run the owner's private ALIVE chat and daily reminders."""
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 import json
 import logging
 import os
+from secrets import token_hex
 import sqlite3
 from time import sleep
 from urllib.error import HTTPError, URLError
@@ -14,7 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from .app import Day, WorkoutState, connect
+from .app import Day, WorkoutState, connect, daily_workout_goal
 
 DEFAULT_MORNING = time(8)
 DEFAULT_EVENING = time(21)
@@ -25,6 +26,7 @@ STIFFNESS_PROMPT = "Утренняя скованность. Ответь чис
 COMMANDS = {
     "start": "Открыть ALIVE", "today": "Что записано сегодня",
     "checkin": "Отметить самочувствие", "reminders": "Расписание напоминаний",
+    "wakeup": "Таймер перерыва на разминку",
 }
 
 
@@ -73,33 +75,39 @@ def read_diary(database, owner, date):
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'alive_workout_state'"
     ).fetchone()
     if table is None:
-        return {}, "empty"
+        return {}, 0, False
     row = database.execute(
         "SELECT state_json FROM alive_workout_state WHERE owner = ?", (f"telegram:{owner}",),
     ).fetchone()
     if row is None:
-        return {}, "empty"
+        return {}, 0, False
     state = json.loads(row[0])
     day = state["diary"].get(date) or {}
-    if any(did_exercise(workout) for workout in day.get("workouts", [])):
-        return day, "recorded"
+    completed = sum(did_exercise(workout) for workout in day.get("workouts", []))
     summary = state.get("summary")
-    if summary and summary.get("date") == date and did_exercise(summary):
-        return day, "summary"
-    return day, "empty"
+    pending = bool(summary and summary.get("date") == date and did_exercise(summary))
+    return day, completed, pending
 
 
-def message(slot, status):
-    if status == "summary":
-        return "Занятие уже пройдено. Открой ALIVE и сохрани итог в дневнике."
-    if status == "recorded":
-        return ("ЛФК за сегодня уже записана. Если ещё не отметил утреннюю скованность — самое время."
-                if slot == "morning" else "ЛФК за сегодня записана. На сегодня задача закрыта.")
+def progress_line(completed, goal):
+    return f"ЛФК за сегодня — {min(completed, goal)}/{goal}."
+
+
+def message(slot, completed, pending, goal):
+    remaining = max(0, goal - completed)
+    progress = progress_line(completed, goal)
+    if pending:
+        return f"{progress} В ALIVE есть несохранённый итог. Сохрани его, чтобы занятие появилось в дневнике."
     if slot == "morning":
-        return ("Утро. Не откладывай ЛФК на потом. Пропускать без причины не рекомендуется. "
-                "Выбери время, а сейчас отметь утреннее самочувствие.")
-    return ("Проверка дня. В дневнике за сегодня ещё нет ЛФК. Пропускать без причины не рекомендуется. "
-            "Если на сегодня уже всё, отметь утомляемость и выбери время для ЛФК завтра.")
+        if not remaining:
+            return f"{progress} Дневная цель выполнена. Если ещё не отметил утреннюю скованность — самое время."
+        return (f"{progress} Утро. Не откладывай ЛФК на потом. Пропускать без причины не рекомендуется. "
+                "Сейчас можно отметить утреннее самочувствие.")
+    if not remaining:
+        return f"Вечерняя отметка. {progress} Дневная цель выполнена."
+    next_workout = "Осталось ещё одно занятие." if remaining == 1 else "Осталось два занятия."
+    return (f"Вечерняя отметка. {progress} {next_workout} "
+            "Пропускать без причины не рекомендуется.")
 
 
 class TelegramFailure(Exception):
@@ -155,10 +163,12 @@ def inline(rows):
     return {"inline_keyboard": rows}
 
 
-def say(settings, text, markup=None):
+def say(settings, text, markup=None, *, parse_mode=None):
     payload = {"chat_id": settings.owner, "text": text}
     if markup is not None:
         payload["reply_markup"] = markup
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
     return telegram(settings, "sendMessage", payload)
 
 
@@ -280,10 +290,10 @@ def metric_value(metric, value):
 
 def today_message(settings, day):
     with closing(sqlite3.connect(settings.database, timeout=8)) as database:
-        entry, status = read_diary(database, settings.owner, day)
-    workout = {"recorded": "записана", "summary": "пройдена, осталось сохранить итог",
-               "empty": "пока без записи"}[status]
-    lines = [f"Сегодня · {day[8:10]}.{day[5:7]}", f"ЛФК — {workout}"]
+        entry, completed, pending = read_diary(database, settings.owner, day)
+    lines = [f"Сегодня · {day[8:10]}.{day[5:7]}", progress_line(completed, daily_workout_goal())]
+    if pending:
+        lines.append("В ALIVE есть несохранённый итог занятия.")
     for metric, label in METRICS.items():
         value = entry.get(metric)
         lines.append(f"{label} — {metric_value(metric, value) if value is not None else 'без отметки'}")
@@ -296,12 +306,127 @@ def owner_message(settings, message):
     return chat.get("type") == "private" and chat.get("id") == settings.owner
 
 
+@contextmanager
+def wake_database(settings):
+    with closing(sqlite3.connect(settings.database, timeout=8)) as database, database:
+        database.execute("""CREATE TABLE IF NOT EXISTS alive_wakeup_timer (
+            owner INTEGER PRIMARY KEY, id TEXT NOT NULL, due_at INTEGER NOT NULL,
+            notified INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0
+        )""")
+        database.execute("""CREATE TABLE IF NOT EXISTS alive_wakeup_breaks (
+            owner INTEGER NOT NULL, timer_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
+            local_day TEXT NOT NULL, PRIMARY KEY (owner, timer_id)
+        )""")
+        yield database
+
+
+def start_wakeup(settings, now, minutes):
+    due_at = int(now.timestamp()) + minutes * 60
+    with wake_database(settings) as database:
+        database.execute(
+            """INSERT INTO alive_wakeup_timer (owner, id, due_at) VALUES (?, ?, ?)
+               ON CONFLICT(owner) DO UPDATE SET id = excluded.id, due_at = excluded.due_at,
+                   notified = 0, attempts = 0""",
+            (settings.owner, token_hex(8), due_at),
+        )
+    at = datetime.fromtimestamp(due_at, settings.zone)
+    return f"WAKE UP · таймер на {minutes} мин. Напомню в {at:%H:%M}."
+
+
+def wakeup_command(settings, now, argument):
+    if argument == "stop":
+        with wake_database(settings) as database:
+            result = database.execute("DELETE FROM alive_wakeup_timer WHERE owner = ?", (settings.owner,))
+        say(settings, "Таймер WAKE UP отменён." if result.rowcount else "Активного таймера WAKE UP нет.")
+        return
+    if argument:
+        if argument.isascii() and argument.isdecimal() and len(argument) <= 3 and 1 <= int(argument) <= 720:
+            say(settings, start_wakeup(settings, now, int(argument)))
+        else:
+            say(settings, "Укажи от 1 до 720 минут, например /wakeup 45. Отмена — /wakeup stop.")
+        return
+    with wake_database(settings) as database:
+        timer = database.execute(
+            "SELECT due_at FROM alive_wakeup_timer WHERE owner = ? AND notified = 0", (settings.owner,),
+        ).fetchone()
+        completed, = database.execute(
+            "SELECT COUNT(*) FROM alive_wakeup_breaks WHERE owner = ? AND local_day = ?",
+            (settings.owner, now.astimezone(settings.zone).date().isoformat()),
+        ).fetchone()
+    title = f"Текущий пинг в {datetime.fromtimestamp(timer[0], settings.zone):%H:%M}." if timer else "Когда напомнить?"
+    buttons = [action(f"{minutes} мин", f"wake:start:{minutes}") for minutes in (30, 45, 60)]
+    say(settings, f"WAKE UP · {title}\nПерерывов за сегодня: {completed}.\n\n"
+        "Выбери время или введи /wakeup 45. Новый таймер заменяет предыдущий.",
+        inline([buttons]))
+
+
+def wakeup_callback(settings, now, operation, value):
+    if operation == "start" and value in ("30", "45", "60"):
+        return start_wakeup(settings, now, int(value))
+    with wake_database(settings) as database:
+        key = (settings.owner, value)
+        if operation == "done":
+            result = database.execute(
+                "DELETE FROM alive_wakeup_timer WHERE owner = ? AND id = ? AND notified = 1", key,
+            )
+            if result.rowcount:
+                database.execute(
+                    """INSERT INTO alive_wakeup_breaks (owner, timer_id, completed_at, local_day)
+                       VALUES (?, ?, ?, ?)""",
+                    (*key, int(now.timestamp()), now.astimezone(settings.zone).date().isoformat()),
+                )
+                return "Перерыв отмечен."
+        elif operation == "snooze":
+            result = database.execute(
+                """UPDATE alive_wakeup_timer SET id = ?, due_at = ?, notified = 0, attempts = 0
+                   WHERE owner = ? AND id = ? AND notified = 1""",
+                (token_hex(8), int(now.timestamp()) + 600, *key),
+            )
+            if result.rowcount:
+                return "Напомню через 10 минут."
+    return "Эта кнопка уже неактуальна. Новый таймер — /wakeup."
+
+
+def tick_wakeup(settings, now):
+    timestamp = int(now.timestamp())
+    with wake_database(settings) as database:
+        timer = database.execute(
+            """UPDATE alive_wakeup_timer SET notified = 1, attempts = attempts + 1
+               WHERE owner = ? AND due_at <= ? AND notified = 0 RETURNING id, attempts""",
+            (settings.owner, timestamp),
+        ).fetchone()
+    if timer is None:
+        return
+    timer_id, attempts = timer
+    buttons = [[action("Размялся", f"wake:done:{timer_id}"),
+                action("Через 10 мин", f"wake:snooze:{timer_id}")]]
+    try:
+        say(settings, "<b>WAKE UP · 3–4 минуты</b>\nПора встать и размяться.\n\n"
+            "<b>1. Ходьба · 2 минуты</b>\nВстань и спокойно пройдись.\n\n"
+            "<b>2. Круги плечами · 3 вперёд и 3 назад</b>\nДвигай плечами плавно, сидя или стоя.\n\n"
+            "<b>3. Повороты головы · по 3 на сторону</b>\n"
+            "По желанию. Сядь прямо, поставь стопы на пол и поворачивай голову, не двигая плечами.\n\n"
+            "<i>Двигайся в комфортной амплитуде, без боли.</i>", inline(buttons), parse_mode="HTML")
+    except TelegramFailure as error:
+        if error.status == 429 and type(error.retry_after) is int and error.retry_after > 0 and attempts < 3:
+            with wake_database(settings) as database:
+                database.execute(
+                    "UPDATE alive_wakeup_timer SET notified = 0, due_at = ? WHERE owner = ? AND id = ?",
+                    (timestamp + error.retry_after, settings.owner, timer_id),
+                )
+        LOG.warning("WAKE UP delivery: Telegram status %s", error.status)
+
+
 def handle_callback(settings, callback, now):
     if callback.get("from", {}).get("id") != settings.owner or not owner_message(
         settings, callback.get("message", {})
     ):
         return
     parts = callback.get("data", "").split(":", 2)
+    if len(parts) == 3 and parts[0] == "wake":
+        answer = wakeup_callback(settings, now, parts[1], parts[2])
+        telegram(settings, "answerCallbackQuery", {"callback_query_id": callback["id"], "text": answer})
+        return
     day = now.date().isoformat()
     answer = "Открой /checkin или /reminders, чтобы обновить кнопки."
     if len(parts) == 3 and parts[1] == day:
@@ -332,13 +457,17 @@ def handle_update(settings, update, now):
     text = msg.get("text", "").strip()
     if not text or not owner_message(settings, msg) or msg.get("from", {}).get("id") != settings.owner:
         return
+    command, _, argument = text.partition(" ")
+    command = command.partition("@")[0].lower()
+    if command == "/wakeup":
+        wakeup_command(settings, now, argument.strip().lower())
+        return
     day = now.date().isoformat()
     if datetime.fromtimestamp(msg.get("date", 0), settings.zone).date() != now.date():
         return
-    command, _, argument = text.partition(" ")
-    command = command.partition("@")[0].lower()
     if command == "/start":
-        say(settings, "ALIVE · ЛФК и дневник.\n/today — сегодня\n/checkin — самочувствие\n/reminders — напоминания",
+        say(settings, "ALIVE · ЛФК и дневник.\n/today — сегодня\n/checkin — самочувствие\n"
+            "/reminders — напоминания\n/wakeup — таймер разминки",
             inline([[open_app("Открыть ALIVE", settings.url)]]))
     elif command == "/today":
         today_message(settings, day)
@@ -390,11 +519,11 @@ def tick(settings, now, send_message=send):
             )
             if update.rowcount == 0:
                 return
-            _, status = read_diary(database, settings.owner, day)
+            _, completed, pending = read_diary(database, settings.owner, day)
 
         retry_at = None
         try:
-            send_message(settings, message(slot, status), slot)
+            send_message(settings, message(slot, completed, pending, daily_workout_goal()), slot)
             result = "sent"
         except TelegramFailure as error:
             if error.status == 429 and type(error.retry_after) is int and error.retry_after > 0:
@@ -440,7 +569,9 @@ def main():
     polling = False
     while True:
         try:
-            tick(settings, datetime.now(settings.zone))
+            now = datetime.now(settings.zone)
+            tick(settings, now)
+            tick_wakeup(settings, now)
         except (sqlite3.Error, ValueError) as error:
             LOG.warning("Diary is temporarily unavailable (%s)", type(error).__name__)
         try:

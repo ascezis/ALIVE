@@ -50,7 +50,7 @@ function SaveIssue({ issue }) {
 }
 
 function WorkoutApp({ storage }) {
-  const { state: { session, timer, summary, diary }, save, saving, issue, isDemo } = storage;
+  const { state: { session, timer, summary, diary }, dailyWorkoutGoal, save, saving, issue, isDemo } = storage;
   const [view, setView] = useState(summary ? 'summary' : 'today');
   const [dark, setDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
   const [timerNow, setTimerNow] = useState(Date.now);
@@ -256,6 +256,7 @@ function WorkoutApp({ storage }) {
       {!checkIn && !confirmRestart && !confirmExit && <SaveIssue issue={issue} />}
       <main ref={main} aria-busy={saving} className={`app-main ${inWorkout ? 'app-main-fixed' : ''}`}>
         {view === 'today' && <Today now={today} session={session} checkIn={diary[todayKey]}
+          dailyWorkoutGoal={dailyWorkoutGoal}
           recent={recent} onStart={resume} onRestart={() => setConfirmRestart(true)}
           onNassLibrary={() => setView('nass-library')}
           onStartVideo={startVideo} onCheckIn={() => setCheckIn({ date: todayKey })} onDiary={selectDay} />}

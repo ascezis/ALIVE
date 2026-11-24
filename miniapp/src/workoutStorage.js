@@ -119,5 +119,8 @@ export function useWorkoutStorage() {
     setLoadAttempt((attempt) => attempt + 1);
   }
 
-  return { state: snapshot?.state, saving, issue, save, retryLoad, isDemo: Boolean(demoState) };
+  return {
+    state: snapshot?.state, dailyWorkoutGoal: snapshot?.dailyWorkoutGoal ?? 1,
+    saving, issue, save, retryLoad, isDemo: Boolean(demoState),
+  };
 }

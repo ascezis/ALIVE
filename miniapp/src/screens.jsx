@@ -17,7 +17,7 @@ function doneCount(results) {
 }
 
 export function Today({
-  now, session, checkIn, recent, onStart, onRestart, onStartVideo, onNassLibrary, onCheckIn, onDiary,
+  now, session, checkIn, dailyWorkoutGoal, recent, onStart, onRestart, onStartVideo, onNassLibrary, onCheckIn, onDiary,
 }) {
   const plan = sessionPlan(session);
   const exerciseCount = plan.exercises.length;
@@ -25,13 +25,16 @@ export function Today({
   const isVideo = session?.mode === 'video';
   const checkInSummary = entryStats(checkIn ?? {});
   const hasCheckIn = Boolean(checkInSummary);
+  const completed = checkIn?.workouts?.filter(
+    (workout) => workout.mode === 'video' || workout.results?.includes('done'),
+  ).length ?? 0;
   return (
     <section className="screen today">
       <p className="meta">{formatDate(now, { weekday: 'long', day: 'numeric', month: 'long' })}</p>
       <h1>Сегодня</h1>
       <div className="plan-card paper-border">
         <div className="row">
-          <p className="meta">{isVideo ? 'Занятие по видео' : 'Комплекс на сегодня'}</p>
+          <p className="meta">ЛФК за день · {Math.min(completed, dailyWorkoutGoal)}/{dailyWorkoutGoal}</p>
           {session && <span className="stamp">Не завершено</span>}
         </div>
         <h2>{isVideo ? videoProgram.title : plan.name}</h2>
